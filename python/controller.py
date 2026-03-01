@@ -13,7 +13,7 @@ class MouseController:
         self.keyboard_manager = KeyboardManager()
         self.mouse_ops = MouseOperations()
         self.indicator = TopBarIndicator()
-        self.event_handler = EventHandler(self.mouse_ops, self.indicator)
+        self.event_handler = EventHandler(self.mouse_ops, self.indicator, self.keyboard_manager)
 
         initial_keyboards = self.keyboard_manager.find_all_keyboards()
         for kbd in initial_keyboards:

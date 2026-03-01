@@ -15,45 +15,86 @@ class KeyboardManager:
         self.monitor_thread = threading.Thread(target=self.monitor_new_devices, daemon=True)
         self.monitor_thread.start()
 
-        self.ensure_capslock_off()
+        self._initial_capslock_check()
 
-    def check_capslock_led_state(self, keyboard):
-        try:
-            leds = keyboard.leds()
-            return ecodes.LED_CAPSL in leds
-        except:
-            return False
+    # ------------------------------------------------------------------ #
+    #  CapsLock helpers                                                    #
+    # ------------------------------------------------------------------ #
 
-    def ensure_capslock_off(self):
+    def is_capslock_on(self):
+        """Read real CapsLock state. Uses sysfs (works on Wayland + X11)."""
+        for path in glob.glob('/sys/class/leds/*capslock*/brightness'):
+            try:
+                with open(path) as f:
+                    if f.read().strip() == '1':
+                        return True
+            except Exception:
+                pass
+        return False
+
+    def _initial_capslock_check(self):
+        """On startup, keyboards aren't grabbed yet — use a minimal UInput to fix."""
         print("🔍 Checking CapsLock state...")
-
-        keyboards = self.find_all_keyboards()
-
-        capslock_on = False
-        for kbd in keyboards:
-            if self.check_capslock_led_state(kbd):
-                capslock_on = True
-                print(f"🔴 CapsLock is ON - turning it off...")
-                break
-
-        if not capslock_on:
+        if not self.is_capslock_on():
             print("✅ CapsLock is already OFF")
             return
 
+        print("🔴 CapsLock is ON — turning it off...")
         try:
-            if keyboards:
-                ui = UInput.from_device(keyboards[0], name='capslock-fix-virtual')
-                for i in range(2):
-                    ui.write(ecodes.EV_KEY, ecodes.KEY_CAPSLOCK, 1)
-                    ui.syn()
-                    ui.write(ecodes.EV_KEY, ecodes.KEY_CAPSLOCK, 0)
-                    ui.syn()
-                ui.close()
-                subprocess.run(['xdotool', 'key', 'Caps_Lock'],
-                              capture_output=True, timeout=2)
-                print("✅ CapsLock turned OFF!")
+            # Create minimal UInput with just KEY_CAPSLOCK — no need to
+            # clone a real keyboard, avoids any filtering/loop issues
+            ui = UInput(
+                events={ecodes.EV_KEY: [ecodes.KEY_CAPSLOCK]},
+                name='capslock-fix-virtual'
+            )
+            time.sleep(0.1)  # Let udev register the device
+            ui.write(ecodes.EV_KEY, ecodes.KEY_CAPSLOCK, 1)
+            ui.syn()
+            time.sleep(0.05)
+            ui.write(ecodes.EV_KEY, ecodes.KEY_CAPSLOCK, 0)
+            ui.syn()
+            time.sleep(0.1)
+            ui.close()
+            if not self.is_capslock_on():
+                print("✅ CapsLock OFF")
+            else:
+                print("⚠️  Could not turn off CapsLock")
         except Exception as e:
             print(f"⚠️  Could not turn off CapsLock: {e}")
+
+    def ensure_capslock_off(self):
+        """
+        Called during session (keyboards already grabbed).
+        Uses self.ui virtual device to inject the keypress.
+        Only acts if CapsLock is actually on.
+        """
+        if not self.is_capslock_on():
+            return
+        if not self.ui:
+            return
+        try:
+            self.ui.write(ecodes.EV_KEY, ecodes.KEY_CAPSLOCK, 1)
+            self.ui.syn()
+            time.sleep(0.05)
+            self.ui.write(ecodes.EV_KEY, ecodes.KEY_CAPSLOCK, 0)
+            self.ui.syn()
+            time.sleep(0.05)
+        except Exception as e:
+            print(f"⚠️  ensure_capslock_off failed: {e}")
+
+    def fix_led_on_exit(self):
+        """Fix LED turning on after ungrab via sysfs."""
+        time.sleep(0.15)
+        for path in glob.glob('/sys/class/leds/*capslock*/brightness'):
+            try:
+                with open(path, 'w') as f:
+                    f.write('0')
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ #
+    #  Keyboard management                                                 #
+    # ------------------------------------------------------------------ #
 
     def find_all_keyboards(self):
         keyboards = []
@@ -139,15 +180,7 @@ class KeyboardManager:
                 except:
                     pass
 
-        # Ungrab causes LED to turn on (kernel quirk).
-        # Write 0 directly to sysfs to fix it.
-        time.sleep(0.15)  # Let ungrab settle
-        for path in glob.glob('/sys/class/leds/*capslock*/brightness'):
-            try:
-                with open(path, 'w') as f:
-                    f.write('0')
-            except Exception:
-                pass  # Not all paths are writable, that's fine
+        self.fix_led_on_exit()
 
         if self.ui:
             self.ui.close()

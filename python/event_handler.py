@@ -2,9 +2,10 @@ from evdev import ecodes
 
 
 class EventHandler:
-    def __init__(self, mouse_ops, indicator=None):
+    def __init__(self, mouse_ops, indicator=None, keyboard_manager=None):
         self.mouse_ops = mouse_ops
         self.indicator = indicator
+        self.keyboard_manager = keyboard_manager
         self.ui = None
 
         self.mouse_mode = False
@@ -61,6 +62,9 @@ class EventHandler:
         if self.indicator:
             self.indicator.hide()
 
+        if self.keyboard_manager:
+            self.keyboard_manager.ensure_capslock_off()
+
         print("Mouse mode: OFF")
 
     def handle_event(self, event):
@@ -88,6 +92,8 @@ class EventHandler:
             else:
                 self.mouse_mode = True
                 self.mouse_ops.pressed_keys.clear()
+                if self.keyboard_manager:
+                    self.keyboard_manager.ensure_capslock_off()
                 if self.indicator:
                     self.indicator.show()
                 print(f"Mouse mode: ON (speed: {self.mouse_ops.base_speed})")
