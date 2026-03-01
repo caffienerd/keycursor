@@ -70,23 +70,17 @@ class EventHandler:
         keycode = event.code
 
         if keycode == ecodes.KEY_CAPSLOCK and event.value == 1:
-            all_keys = list(range(ecodes.KEY_A, ecodes.KEY_Z + 1))
-            all_keys.extend(range(ecodes.KEY_1, ecodes.KEY_0 + 1))
-            all_keys.extend([ecodes.KEY_MINUS, ecodes.KEY_EQUAL,
-                           ecodes.KEY_LEFTBRACE, ecodes.KEY_RIGHTBRACE, ecodes.KEY_SEMICOLON,
-                           ecodes.KEY_APOSTROPHE, ecodes.KEY_GRAVE, ecodes.KEY_BACKSLASH,
-                           ecodes.KEY_COMMA, ecodes.KEY_DOT, ecodes.KEY_SLASH,
-                           ecodes.KEY_LEFTCTRL, ecodes.KEY_RIGHTCTRL])
-
+            # Release ALL currently held keys so nothing gets stuck
+            # when mouse mode is toggled mid-keypress.
             if self.ui:
-                for key in all_keys:
+                for key in range(ecodes.KEY_MAX):
                     try:
                         self.ui.write(ecodes.EV_KEY, key, 0)
-                    except:
+                    except Exception:
                         pass
                 try:
                     self.ui.syn()
-                except:
+                except Exception:
                     pass
 
             if self.mouse_mode:
