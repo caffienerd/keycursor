@@ -6,3 +6,5 @@ __pycache__/
 
 # build elements
 python.test/
+pyrightconfig.json
+requirements.txt
