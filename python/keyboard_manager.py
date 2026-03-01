@@ -1,28 +1,48 @@
 import time
 import glob
 import threading
-import subprocess
 from evdev import InputDevice, UInput, ecodes, list_devices
+
+
+# Names of virtual devices we create — never grab these
+VIRTUAL_DEVICE_NAMES = ['ydotool', 'kb-mouse', 'capslock-fix', 'capslock-fix-virtual']
+
+
+def is_virtual(name: str) -> bool:
+    n = name.lower()
+    return any(x in n for x in VIRTUAL_DEVICE_NAMES)
+
+
+def is_keyboard(device: InputDevice) -> bool:
+    """True if the device has a full alpha key set."""
+    try:
+        caps = device.capabilities()
+        if ecodes.EV_KEY in caps:
+            keys = caps[ecodes.EV_KEY]
+            return ecodes.KEY_A in keys and ecodes.KEY_Z in keys
+    except Exception:
+        pass
+    return False
 
 
 class KeyboardManager:
     def __init__(self):
-        self.keyboards = {}
+        self.keyboards: dict[str, InputDevice] = {}  # path -> device
         self.keyboards_lock = threading.Lock()
-        self.ui = None
+        self.ui: UInput | None = None
         self.running = True
 
-        self.monitor_thread = threading.Thread(target=self.monitor_new_devices, daemon=True)
-        self.monitor_thread.start()
-
         self._initial_capslock_check()
+
+        self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.monitor_thread.start()
 
     # ------------------------------------------------------------------ #
     #  CapsLock helpers                                                    #
     # ------------------------------------------------------------------ #
 
-    def is_capslock_on(self):
-        """Read real CapsLock state. Uses sysfs (works on Wayland + X11)."""
+    def is_capslock_on(self) -> bool:
+        """Read real CapsLock state from sysfs — works on Wayland + X11."""
         for path in glob.glob('/sys/class/leds/*capslock*/brightness'):
             try:
                 with open(path) as f:
@@ -33,7 +53,7 @@ class KeyboardManager:
         return False
 
     def _initial_capslock_check(self):
-        """On startup, keyboards aren't grabbed yet — use a minimal UInput to fix."""
+        """At startup keyboards aren't grabbed yet — use minimal UInput."""
         print("🔍 Checking CapsLock state...")
         if not self.is_capslock_on():
             print("✅ CapsLock is already OFF")
@@ -41,13 +61,11 @@ class KeyboardManager:
 
         print("🔴 CapsLock is ON — turning it off...")
         try:
-            # Create minimal UInput with just KEY_CAPSLOCK — no need to
-            # clone a real keyboard, avoids any filtering/loop issues
             ui = UInput(
                 events={ecodes.EV_KEY: [ecodes.KEY_CAPSLOCK]},
                 name='capslock-fix-virtual'
             )
-            time.sleep(0.1)  # Let udev register the device
+            time.sleep(0.1)
             ui.write(ecodes.EV_KEY, ecodes.KEY_CAPSLOCK, 1)
             ui.syn()
             time.sleep(0.05)
@@ -55,22 +73,13 @@ class KeyboardManager:
             ui.syn()
             time.sleep(0.1)
             ui.close()
-            if not self.is_capslock_on():
-                print("✅ CapsLock OFF")
-            else:
-                print("⚠️  Could not turn off CapsLock")
+            print("✅ CapsLock OFF" if not self.is_capslock_on() else "⚠️  Could not turn off CapsLock")
         except Exception as e:
             print(f"⚠️  Could not turn off CapsLock: {e}")
 
     def ensure_capslock_off(self):
-        """
-        Called during session (keyboards already grabbed).
-        Uses self.ui virtual device to inject the keypress.
-        Only acts if CapsLock is actually on.
-        """
-        if not self.is_capslock_on():
-            return
-        if not self.ui:
+        """During session — inject via self.ui virtual device."""
+        if not self.is_capslock_on() or not self.ui:
             return
         try:
             self.ui.write(ecodes.EV_KEY, ecodes.KEY_CAPSLOCK, 1)
@@ -78,12 +87,11 @@ class KeyboardManager:
             time.sleep(0.05)
             self.ui.write(ecodes.EV_KEY, ecodes.KEY_CAPSLOCK, 0)
             self.ui.syn()
-            time.sleep(0.05)
         except Exception as e:
             print(f"⚠️  ensure_capslock_off failed: {e}")
 
-    def fix_led_on_exit(self):
-        """Fix LED turning on after ungrab via sysfs."""
+    def _fix_led_on_exit(self):
+        """Ungrab causes LED to turn on — fix via sysfs."""
         time.sleep(0.15)
         for path in glob.glob('/sys/class/leds/*capslock*/brightness'):
             try:
@@ -93,94 +101,139 @@ class KeyboardManager:
                 pass
 
     # ------------------------------------------------------------------ #
-    #  Keyboard management                                                 #
+    #  Device management                                                   #
     # ------------------------------------------------------------------ #
 
-    def find_all_keyboards(self):
-        keyboards = []
-        devices = [InputDevice(path) for path in list_devices()]
+    def _try_grab(self, path: str) -> bool:
+        """
+        Try to open and grab a device at path.
+        Returns True if successfully added.
+        Handles devices that exist in list_devices() but aren't ready yet
+        (e.g. just woke from sleep).
+        """
+        try:
+            device = InputDevice(path)
 
-        for device in devices:
-            if 'ydotool' in device.name.lower() or 'kb-mouse' in device.name.lower():
-                continue
+            if is_virtual(device.name):
+                return False
 
-            caps = device.capabilities()
-            if ecodes.EV_KEY in caps:
-                keys = caps[ecodes.EV_KEY]
-                if ecodes.KEY_A in keys and ecodes.KEY_Z in keys:
-                    keyboards.append(device)
-                    print(f"Found keyboard: {device.name} ({device.path})")
+            if not is_keyboard(device):
+                return False
 
-        return keyboards
+            # Already tracked — check if the fd is still alive
+            with self.keyboards_lock:
+                if path in self.keyboards:
+                    return True  # Already grabbed, nothing to do
 
-    def add_keyboard(self, device):
+            device.grab()
+
+            with self.keyboards_lock:
+                self.keyboards[path] = device
+
+            print(f"+ Grabbed: {device.name} ({path})")
+            return True
+
+        except Exception:
+            return False
+
+    def _release(self, path: str, reason: str = 'removed'):
+        """Ungrab and remove a device."""
         with self.keyboards_lock:
-            if device.path not in self.keyboards:
-                try:
-                    device.grab()
-                    self.keyboards[device.path] = device
-                    print(f"+ Added: {device.name}")
-                except Exception as e:
-                    print(f"Failed to add {device.name}: {e}")
+            device = self.keyboards.pop(path, None)
 
-    def remove_keyboard(self, path):
-        with self.keyboards_lock:
-            if path in self.keyboards:
-                device = self.keyboards[path]
-                try:
-                    device.ungrab()
-                except:
-                    pass
-                print(f"- Removed: {device.name}")
-                del self.keyboards[path]
+        if device:
+            try:
+                device.ungrab()
+            except Exception:
+                pass
+            try:
+                device.close()
+            except Exception:
+                pass
+            print(f"- Released ({reason}): {device.name} ({path})")
 
-    def monitor_new_devices(self):
-        known_paths = set()
+    def _monitor_loop(self):
+        """
+        Main device monitor. Handles:
+        - New devices (plugged in, woke from sleep, reconnected)
+        - Removed devices (unplugged, went to sleep)
+        - Stale fds (device path reused after sleep/wake)
+        Polls every 0.5s for fast response to sleep/wake events.
+        """
+        known_paths: set[str] = set()
 
         while self.running:
             try:
-                current_devices = list_devices()
-                current_paths = set(current_devices)
+                current_paths = set(list_devices())
 
-                new_paths = current_paths - known_paths
-                for path in new_paths:
-                    try:
-                        device = InputDevice(path)
-                        if 'ydotool' in device.name.lower() or 'kb-mouse' in device.name.lower():
-                            known_paths.add(path)
-                            continue
-                        caps = device.capabilities()
-                        if ecodes.EV_KEY in caps:
-                            keys = caps[ecodes.EV_KEY]
-                            if ecodes.KEY_A in keys and ecodes.KEY_Z in keys:
-                                self.add_keyboard(device)
-                                known_paths.add(path)
-                    except:
-                        pass
+                # --- New or returned devices ---
+                for path in current_paths - known_paths:
+                    if self._try_grab(path):
+                        known_paths.add(path)
+                    else:
+                        # Not a keyboard or virtual — still track path so we
+                        # don't retry it every loop
+                        known_paths.add(path)
 
-                removed_paths = known_paths - current_paths
-                for path in removed_paths:
-                    self.remove_keyboard(path)
+                # --- Removed devices ---
+                for path in known_paths - current_paths:
+                    self._release(path, reason='disconnected')
                     known_paths.discard(path)
 
-                time.sleep(2)
-            except:
-                time.sleep(2)
+                # --- Health check existing grabbed devices ---
+                # A device that woke from sleep may reuse the same path but
+                # have a dead fd — detect this and re-grab.
+                with self.keyboards_lock:
+                    grabbed_paths = list(self.keyboards.keys())
 
-    def get_devices(self):
+                for path in grabbed_paths:
+                    with self.keyboards_lock:
+                        device = self.keyboards.get(path)
+                    if device is None:
+                        continue
+                    try:
+                        # Try reading fd state — raises OSError if dead
+                        device.fd
+                        _ = device.name
+                    except Exception:
+                        print(f"↻ Dead fd detected: {path} — re-grabbing...")
+                        self._release(path, reason='dead fd')
+                        known_paths.discard(path)  # Force rediscovery next loop
+
+            except Exception as e:
+                print(f"[monitor] error: {e}")
+
+            time.sleep(0.5)
+
+    def find_all_keyboards(self):
+        """Return list of InputDevice for all current keyboards (for UInput init)."""
+        result = []
+        for path in list_devices():
+            try:
+                device = InputDevice(path)
+                if not is_virtual(device.name) and is_keyboard(device):
+                    result.append(device)
+            except Exception:
+                pass
+        return result
+
+    def get_devices(self) -> list[InputDevice]:
         with self.keyboards_lock:
             return list(self.keyboards.values())
 
     def cleanup(self):
         self.running = False
-        with self.keyboards_lock:
-            for device in self.keyboards.values():
-                try:
-                    device.ungrab()
-                except:
-                    pass
 
-        self.fix_led_on_exit()
+        with self.keyboards_lock:
+            paths = list(self.keyboards.keys())
+
+        for path in paths:
+            self._release(path, reason='exit')
+
+        self._fix_led_on_exit()
 
         if self.ui:
-            self.ui.close()
+            try:
+                self.ui.close()
+            except Exception:
+                pass
